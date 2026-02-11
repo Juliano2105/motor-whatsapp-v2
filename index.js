@@ -1,4 +1,5 @@
-require("dotenv").config()
+try { require("dotenv").config() } catch {}
+
 const fs = require("fs")
 const path = require("path")
 const express = require("express")
@@ -42,7 +43,7 @@ const mem = {
 function pushMessage(sessionId, msg) {
   if (!mem.messages[sessionId]) mem.messages[sessionId] = []
   mem.messages[sessionId].push(msg)
-  if (mem.messages[sessionId].length > 2000) mem.messages[sessionId].shift()
+  if (mem.messages[sessionId].length > 5000) mem.messages[sessionId].shift()
 }
 
 function upsertChat(sessionId, jid, lastMessage) {
@@ -74,7 +75,12 @@ async function saveIncomingMedia(sock, msg, messageType) {
   const filepath = path.join(MEDIA_DIR, filename)
   fs.writeFileSync(filepath, buffer)
 
-  return { filepath, filename, mimetype }
+  return {
+    filepath,
+    filename,
+    mimetype,
+    url: `/media/${encodeURIComponent(filename)}`
+  }
 }
 
 async function runBot(sock, jid, text) {
@@ -112,7 +118,8 @@ async function createClient(sessionId) {
     version,
     logger: P({ level: "silent" }),
     printQRInTerminal: false,
-    auth: state
+    auth: state,
+    generateHighQualityLinkPreview: true
   })
 
   store.bind(sock.ev)
@@ -120,11 +127,14 @@ async function createClient(sessionId) {
   mem.sessions[sessionId] = mem.sessions[sessionId] || {}
   mem.sessions[sessionId].status = "Conectando"
   mem.sessions[sessionId].qr = null
+  mem.sessions[sessionId].me = mem.sessions[sessionId].me || null
+  mem.sessions[sessionId].lastEventAt = Date.now()
 
   sock.ev.on("creds.update", saveCreds)
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update
+    mem.sessions[sessionId].lastEventAt = Date.now()
 
     if (qr) {
       const b64 = await QRCode.toDataURL(qr)
@@ -148,6 +158,7 @@ async function createClient(sessionId) {
       const shouldReconnect = code !== DisconnectReason.loggedOut
 
       if (shouldReconnect) {
+        delete clients[sessionId]
         setTimeout(() => createClient(sessionId), 1500)
       }
     }
@@ -156,6 +167,8 @@ async function createClient(sessionId) {
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0]
     if (!msg?.message) return
+
+    mem.sessions[sessionId].lastEventAt = Date.now()
 
     const jid = msg.key.remoteJid
     const fromMe = !!msg.key.fromMe
@@ -170,10 +183,11 @@ async function createClient(sessionId) {
       id: msg.key.id,
       jid,
       fromMe,
-      timestamp: msg.messageTimestamp ? Number(msg.messageTimestamp) : Date.now() / 1000,
+      timestamp: msg.messageTimestamp ? Number(msg.messageTimestamp) : Math.floor(Date.now() / 1000),
       type: messageType,
       pushName: msg.pushName || null,
-      participant: msg.key.participant || null
+      participant: msg.key.participant || null,
+      hasQuoted: !!msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
     }
 
     const isMedia =
@@ -220,6 +234,16 @@ async function createClient(sessionId) {
     }
   })
 
+  sock.ev.on("message-receipt.update", (updates) => {
+    mem.sessions[sessionId].lastEventAt = Date.now()
+    broadcast("receipt", { sessionId, updates })
+  })
+
+  sock.ev.on("presence.update", (p) => {
+    mem.sessions[sessionId].lastEventAt = Date.now()
+    broadcast("presence", { sessionId, presence: p })
+  })
+
   clients[sessionId] = sock
   return sock
 }
@@ -234,7 +258,8 @@ function listSessions() {
     sessionId: id,
     status: mem.sessions[id]?.status || "Desconhecido",
     hasQr: !!mem.sessions[id]?.qr,
-    me: mem.sessions[id]?.me || null
+    me: mem.sessions[id]?.me || null,
+    lastEventAt: mem.sessions[id]?.lastEventAt || null
   }))
 }
 
@@ -248,6 +273,16 @@ function broadcast(event, payload) {
   })
 }
 
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    try {
+      if (ws.isAlive === false) return ws.terminate()
+      ws.isAlive = false
+      ws.ping()
+    } catch {}
+  })
+}, 30000)
+
 function normalizeToJid(number, jid) {
   const cleanNumber = String(number || "").replace(/\D/g, "")
   const finalNumber =
@@ -256,6 +291,22 @@ function normalizeToJid(number, jid) {
       : cleanNumber
   return jid || (finalNumber + "@s.whatsapp.net")
 }
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    sessions: listSessions().length,
+    node: process.version
+  })
+})
+
+app.get("/media/:filename", (req, res) => {
+  const filename = req.params.filename
+  const filepath = path.join(MEDIA_DIR, filename)
+  if (!fs.existsSync(filepath)) return res.status(404).json({ error: "Arquivo não encontrado" })
+  res.sendFile(path.resolve(filepath))
+})
 
 app.get("/sessions", (req, res) => res.json({ sessions: listSessions() }))
 
@@ -268,7 +319,7 @@ app.post("/sessions/:sessionId/start", async (req, res) => {
 app.get("/sessions/:sessionId/status", (req, res) => {
   const { sessionId } = req.params
   const s = mem.sessions[sessionId] || {}
-  res.json({ status: s.status || "Desconhecido", me: s.me || null })
+  res.json({ status: s.status || "Desconhecido", me: s.me || null, lastEventAt: s.lastEventAt || null })
 })
 
 app.get("/sessions/:sessionId/qr", (req, res) => {
@@ -280,23 +331,32 @@ app.get("/sessions/:sessionId/qr", (req, res) => {
 app.get("/sessions/:sessionId/messages", (req, res) => {
   const { sessionId } = req.params
   const limit = Math.min(Number(req.query.limit || 200), 2000)
+  const before = req.query.before ? Number(req.query.before) : null
+
   const arr = mem.messages[sessionId] || []
-  res.json({ messages: arr.slice(-limit) })
+  const filtered = before
+    ? arr.filter((m) => Number(m.timestamp || 0) < before)
+    : arr
+
+  res.json({
+    messages: filtered.slice(-limit),
+    nextBefore: filtered.length ? Number(filtered[0]?.timestamp || 0) : null
+  })
 })
 
 app.get("/sessions/:sessionId/chats", (req, res) => {
   const { sessionId } = req.params
   const chats = mem.chats[sessionId] || {}
-  const list = Object.values(chats).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+  const list = Object.values(chats).sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
   res.json({ chats: list })
 })
 
 app.post("/sessions/:sessionId/send/text", async (req, res) => {
   const { sessionId } = req.params
   const { number, jid, text } = req.body || {}
+  if (!jid && !number) return res.status(400).json({ error: "Informe jid ou number" })
 
   const sock = await ensureSession(sessionId)
-
   const targetJid = normalizeToJid(number, jid)
 
   await sock.sendMessage(targetJid, { text: String(text || "") })
@@ -306,8 +366,10 @@ app.post("/sessions/:sessionId/send/text", async (req, res) => {
 app.post("/sessions/:sessionId/send/image", async (req, res) => {
   const { sessionId } = req.params
   const { jid, number, imageUrl, caption } = req.body || {}
-  const sock = await ensureSession(sessionId)
+  if (!jid && !number) return res.status(400).json({ error: "Informe jid ou number" })
+  if (!imageUrl) return res.status(400).json({ error: "Informe imageUrl" })
 
+  const sock = await ensureSession(sessionId)
   const targetJid = normalizeToJid(number, jid)
 
   await sock.sendMessage(targetJid, { image: { url: imageUrl }, caption: caption || "" })
@@ -317,8 +379,10 @@ app.post("/sessions/:sessionId/send/image", async (req, res) => {
 app.post("/sessions/:sessionId/send/video", async (req, res) => {
   const { sessionId } = req.params
   const { jid, number, videoUrl, caption } = req.body || {}
-  const sock = await ensureSession(sessionId)
+  if (!jid && !number) return res.status(400).json({ error: "Informe jid ou number" })
+  if (!videoUrl) return res.status(400).json({ error: "Informe videoUrl" })
 
+  const sock = await ensureSession(sessionId)
   const targetJid = normalizeToJid(number, jid)
 
   await sock.sendMessage(targetJid, { video: { url: videoUrl }, caption: caption || "" })
@@ -328,8 +392,10 @@ app.post("/sessions/:sessionId/send/video", async (req, res) => {
 app.post("/sessions/:sessionId/send/audio", async (req, res) => {
   const { sessionId } = req.params
   const { jid, number, audioUrl, ptt } = req.body || {}
-  const sock = await ensureSession(sessionId)
+  if (!jid && !number) return res.status(400).json({ error: "Informe jid ou number" })
+  if (!audioUrl) return res.status(400).json({ error: "Informe audioUrl" })
 
+  const sock = await ensureSession(sessionId)
   const targetJid = normalizeToJid(number, jid)
 
   await sock.sendMessage(targetJid, {
@@ -340,11 +406,72 @@ app.post("/sessions/:sessionId/send/audio", async (req, res) => {
   res.json({ ok: true })
 })
 
+app.post("/sessions/:sessionId/send/document", async (req, res) => {
+  const { sessionId } = req.params
+  const { jid, number, documentUrl, fileName, mimetype, caption } = req.body || {}
+  if (!jid && !number) return res.status(400).json({ error: "Informe jid ou number" })
+  if (!documentUrl) return res.status(400).json({ error: "Informe documentUrl" })
+
+  const sock = await ensureSession(sessionId)
+  const targetJid = normalizeToJid(number, jid)
+
+  await sock.sendMessage(targetJid, {
+    document: { url: documentUrl },
+    fileName: fileName || "arquivo",
+    mimetype: mimetype || "application/octet-stream",
+    caption: caption || ""
+  })
+  res.json({ ok: true })
+})
+
+app.post("/sessions/:sessionId/read", async (req, res) => {
+  const { sessionId } = req.params
+  const { jid, messageIds } = req.body || {}
+  if (!jid || !Array.isArray(messageIds) || messageIds.length === 0) {
+    return res.status(400).json({ error: "Informe jid e messageIds" })
+  }
+
+  const sock = await ensureSession(sessionId)
+  const keys = messageIds.map((id) => ({ remoteJid: jid, fromMe: false, id }))
+  await sock.readMessages(keys)
+  res.json({ ok: true })
+})
+
+app.post("/sessions/:sessionId/presence", async (req, res) => {
+  const { sessionId } = req.params
+  const { jid, state } = req.body || {}
+  if (!jid) return res.status(400).json({ error: "Informe jid" })
+
+  const sock = await ensureSession(sessionId)
+  await sock.sendPresenceUpdate(state || "available", jid)
+  res.json({ ok: true })
+})
+
 app.get("/sessions/:sessionId/groups", async (req, res) => {
   const { sessionId } = req.params
   const sock = await ensureSession(sessionId)
   const groups = await sock.groupFetchAllParticipating()
   res.json({ groups })
+})
+
+app.get("/sessions/:sessionId/group-metadata", async (req, res) => {
+  const { sessionId } = req.params
+  const jid = String(req.query.jid || "")
+  if (!jid) return res.status(400).json({ error: "Informe jid" })
+
+  const sock = await ensureSession(sessionId)
+  const md = await sock.groupMetadata(jid)
+  res.json({ metadata: md })
+})
+
+app.get("/sessions/:sessionId/profile-pic", async (req, res) => {
+  const { sessionId } = req.params
+  const jid = String(req.query.jid || "")
+  if (!jid) return res.status(400).json({ error: "Informe jid" })
+
+  const sock = await ensureSession(sessionId)
+  const url = await sock.profilePictureUrl(jid, "image").catch(() => null)
+  res.json({ url })
 })
 
 httpServer = app.listen(PORT, () => {
@@ -354,6 +481,8 @@ httpServer = app.listen(PORT, () => {
 httpServer.on("upgrade", (req, socket, head) => {
   if (req.url === "/ws") {
     wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.isAlive = true
+      ws.on("pong", () => { ws.isAlive = true })
       wss.emit("connection", ws, req)
     })
   } else {
