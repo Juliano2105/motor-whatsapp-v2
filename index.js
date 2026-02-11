@@ -13,7 +13,6 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeInMemoryStore,
   downloadMediaMessage
 } = require("@whiskeysockets/baileys")
 
@@ -103,16 +102,12 @@ async function runBot(sock, jid, text) {
 }
 
 const clients = {}
-const stores = {}
 
 async function createClient(sessionId) {
   ensureDir(path.join(SESSIONS_DIR, sessionId))
 
   const { state, saveCreds } = await useMultiFileAuthState(path.join(SESSIONS_DIR, sessionId))
   const { version } = await fetchLatestBaileysVersion()
-
-  const store = makeInMemoryStore({ logger: P().child({ level: "silent" }) })
-  stores[sessionId] = store
 
   const sock = makeWASocket({
     version,
@@ -121,8 +116,6 @@ async function createClient(sessionId) {
     auth: state,
     generateHighQualityLinkPreview: true
   })
-
-  store.bind(sock.ev)
 
   mem.sessions[sessionId] = mem.sessions[sessionId] || {}
   mem.sessions[sessionId].status = "Conectando"
@@ -291,6 +284,10 @@ function normalizeToJid(number, jid) {
       : cleanNumber
   return jid || (finalNumber + "@s.whatsapp.net")
 }
+
+// ========================================
+// ENDPOINTS
+// ========================================
 
 app.get("/health", (req, res) => {
   res.json({
@@ -474,21 +471,10 @@ app.get("/sessions/:sessionId/profile-pic", async (req, res) => {
   res.json({ url })
 })
 
-httpServer = app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT)
-})
+// ========================================
+// ATALHOS (compatibilidade com frontend)
+// ========================================
 
-httpServer.on("upgrade", (req, socket, head) => {
-  if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      ws.isAlive = true
-      ws.on("pong", () => { ws.isAlive = true })
-      wss.emit("connection", ws, req)
-    })
-  } else {
-    socket.destroy()
-  }
-})
 app.get("/status", (req, res) => {
   const sessions = listSessions()
 
@@ -496,17 +482,21 @@ app.get("/status", (req, res) => {
     return res.json({
       ok: true,
       connected: false,
+      status: "",
+      qr: null,
       sessions: []
     })
   }
 
   const first = sessions[0]
+  const sessionData = mem.sessions[first.sessionId] || {}
 
   res.json({
     ok: true,
     connected: first.status === "Conectado",
     sessionId: first.sessionId,
     status: first.status,
+    qr: sessionData.qr || null,
     sessions
   })
 })
@@ -531,4 +521,128 @@ app.get("/messages", (req, res) => {
     total: arr.length,
     messages: arr.slice(-limit)
   })
+})
+
+app.get("/history", (req, res) => {
+  const sessionIds = Object.keys(mem.sessions || {})
+
+  if (!sessionIds.length) {
+    return res.json({ ok: true, total: 0, messages: [] })
+  }
+
+  const sessionId = sessionIds[0]
+  const limit = parseInt(req.query.limit) || 0
+  const offset = parseInt(req.query.offset) || 0
+
+  let messages = [...(mem.messages[sessionId] || [])]
+  messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+
+  if (offset > 0) messages = messages.slice(offset)
+  if (limit > 0) messages = messages.slice(0, limit)
+
+  res.json({
+    ok: true,
+    total: (mem.messages[sessionId] || []).length,
+    returned: messages.length,
+    messages
+  })
+})
+
+app.get("/chats", (req, res) => {
+  const sessionIds = Object.keys(mem.sessions || {})
+
+  if (!sessionIds.length) {
+    return res.json({ ok: true, total: 0, chats: [] })
+  }
+
+  const sessionId = sessionIds[0]
+  const allMsgs = mem.messages[sessionId] || []
+  const chatMap = {}
+
+  for (const msg of allMsgs) {
+    const chatId = msg.jid || "unknown"
+    if (chatId.includes("status@broadcast")) continue
+
+    if (!chatMap[chatId]) {
+      chatMap[chatId] = {
+        id: chatId,
+        name: msg.pushName || chatId,
+        lastMessage: "",
+        lastTimestamp: 0,
+        messageCount: 0,
+        unreadCount: 0
+      }
+    }
+
+    const chat = chatMap[chatId]
+    chat.messageCount++
+
+    const ts = msg.timestamp || 0
+    if (ts > chat.lastTimestamp) {
+      chat.lastTimestamp = ts
+      chat.lastMessage = msg.text || ""
+      if (msg.pushName) chat.name = msg.pushName
+    }
+
+    if (!msg.fromMe) chat.unreadCount++
+  }
+
+  let chats = Object.values(chatMap)
+  chats.sort((a, b) => b.lastTimestamp - a.lastTimestamp)
+
+  res.json({
+    ok: true,
+    total: chats.length,
+    chats
+  })
+})
+
+app.get("/search", (req, res) => {
+  const query = (req.query.q || "").toLowerCase().trim()
+  const limit = parseInt(req.query.limit) || 20
+  const sessionIds = Object.keys(mem.sessions || {})
+
+  if (!query || !sessionIds.length) {
+    return res.json({ ok: true, query, total: 0, results: [] })
+  }
+
+  const sessionId = sessionIds[0]
+  const allMsgs = mem.messages[sessionId] || []
+
+  const results = allMsgs.filter((msg) => {
+    const text = (msg.text || "").toLowerCase()
+    const from = (msg.jid || "").toLowerCase()
+    const name = (msg.pushName || "").toLowerCase()
+    return text.includes(query) || from.includes(query) || name.includes(query)
+  })
+
+  results.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+
+  res.json({
+    ok: true,
+    query,
+    total: results.length,
+    returned: Math.min(results.length, limit),
+    results: results.slice(0, limit)
+  })
+})
+
+// ========================================
+// SERVIDOR
+// ========================================
+
+httpServer = app.listen(PORT, () => {
+  console.log("Servidor rodando na porta", PORT)
+})
+
+httpServer.on("upgrade", (req, socket, head) => {
+  if (req.url === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.isAlive = true
+      ws.on("pong", () => { ws.isAlive = true })
+      wss.emit("connection", ws, req)
+    })
+  } else {
+    socket.destroy()
+  }
 })
