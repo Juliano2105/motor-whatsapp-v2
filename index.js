@@ -489,3 +489,46 @@ httpServer.on("upgrade", (req, socket, head) => {
     socket.destroy()
   }
 })
+app.get("/status", (req, res) => {
+  const sessions = listSessions()
+
+  if (!sessions.length) {
+    return res.json({
+      ok: true,
+      connected: false,
+      sessions: []
+    })
+  }
+
+  const first = sessions[0]
+
+  res.json({
+    ok: true,
+    connected: first.status === "Conectado",
+    sessionId: first.sessionId,
+    status: first.status,
+    sessions
+  })
+})
+
+app.get("/messages", (req, res) => {
+  const sessionIds = Object.keys(mem.sessions || {})
+
+  if (!sessionIds.length) {
+    return res.json({
+      ok: true,
+      messages: []
+    })
+  }
+
+  const sessionId = sessionIds[0]
+  const limit = Math.min(Number(req.query.limit || 200), 2000)
+  const arr = mem.messages[sessionId] || []
+
+  res.json({
+    ok: true,
+    sessionId,
+    total: arr.length,
+    messages: arr.slice(-limit)
+  })
+})
