@@ -1,100 +1,110 @@
+const { default: makeWASocket, useMultiFileAuthState, disconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const express = require('express');
-const cors = require('cors');
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, delay, DisconnectReason } = require("@whiskeysockets/baileys");
-const QRCode = require('qrcode');
 const fs = require('fs');
-const pino = require('pino');
+const path = require('path');
+const cors = require('cors');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors());
 
-let qrCodeBase64 = null;
+// 1. CONFIGURAÇÃO DE MÍDIA: Cria e serve a pasta para o Lovable acessar fotos/áudios
+const mediaFolder = path.join(__dirname, 'media');
+if (!fs.existsSync(mediaFolder)) fs.mkdirSync(mediaFolder, { recursive: true });
+app.use('/media', express.static(mediaFolder));
+
+let sock;
 let connectionStatus = "Desconectado";
-let sock = null;
-let messagesHistory = []; // Memória para o seu site estilo WhatsApp
+let qrCode = null;
+let messageStore = [];
 
-async function connectToWA() {
-    // Pasta definitiva para sua sessão paga no Railway
-    const { state, saveCreds } = await useMultiFileAuthState('./sessao_definitiva');
-    const { version } = await fetchLatestBaileysVersion();
+// 2. REGRA DO 9: Função para garantir que o número seja enviado sem o dígito 9 extra
+function formatBRNumber(number) {
+    let clean = String(number).replace(/\D/g, '');
+    if (clean.length === 13 && clean.startsWith('55')) {
+        clean = clean.slice(0, 4) + clean.slice(5);
+    }
+    if (!clean.startsWith('55')) clean = '55' + clean;
+    return clean + '@s.whatsapp.net';
+}
 
+async function connectToWhatsApp() {
+    // 3. FIXAÇÃO DE SESSÃO: Usa a pasta fixa para retomar a conexão sem novo QR Code
+    const { state, saveCreds } = await useMultiFileAuthState('sessao_definitiva');
+    
     sock = makeWASocket({
-        version,
         auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ["macOS", "Safari", "17.0"], // Identidade segura
-        syncFullHistory: false,
-        shouldSyncHistoryMessage: () => false,
-        markOnlineOnConnect: true
+        printQRInTerminal: true,
+        defaultQueryTimeoutMs: undefined
     });
 
-    // --- MOTOR DE ESCUTA (ROBÔ E CHAT) ---
-    sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-
-        const from = msg.key.remoteJid;
-        const name = msg.pushName || "Cliente";
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "Mídia recebida";
-
-        // 1. Salva no histórico para o seu Dashboard no Lovable
-        messagesHistory.push({
-            id: msg.key.id,
-            from: from.replace('@s.whatsapp.net', ''),
-            name: name,
-            text: text,
-            time: new Date().toLocaleTimeString('pt-BR')
-        });
-
-        // 2. LÓGICA DO ROBÔ (CHATBOT)
-        const mensagemBaixa = text.toLowerCase();
-        if (mensagemBaixa === 'oi' || mensagemBaixa === 'olá') {
-            await delay(2000); // Espera 2 segundos para parecer humano
-            await sock.sendMessage(from, { text: `Olá ${name}! Bem-vindo ao atendimento automático. Como posso te ajudar?` });
-        }
-    });
-
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            qrCodeBase64 = await QRCode.toDataURL(qr);
-            connectionStatus = "Aguardando Leitura";
-        }
-        
-        if (connection === 'open') {
-            qrCodeBase64 = null;
-            connectionStatus = "Conectado";
-            console.log("SISTEMA COMPLETO ONLINE!");
-        }
-        
+        if (qr) qrCode = qr;
+
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) setTimeout(() => connectToWA(), 5000);
+            const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== disconnectReason.loggedOut;
+            if (shouldReconnect) connectToWhatsApp(); // Reconecta automaticamente
+        } else if (connection === 'open') {
+            connectionStatus = "Conectado";
+            qrCode = null;
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        for (const msg of messages) {
+            if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
+
+            let msgData = {
+                id: msg.key.id,
+                from: msg.key.remoteJid,
+                fromMe: msg.key.fromMe || false,
+                name: msg.pushName || 'Contato',
+                timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
+                type: 'text',
+                text: msg.message.conversation || msg.message.extendedTextMessage?.text || '',
+                mediaUrl: null
+            };
+
+            // 4. PROCESSAMENTO DE MÍDIA: Baixa fotos, vídeos e áudios
+            const isImage = msg.message.imageMessage;
+            const isVideo = msg.message.videoMessage;
+            const isAudio = msg.message.audioMessage;
+
+            if (isImage || isVideo || isAudio) {
+                try {
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                    const extension = isImage ? 'jpg' : isVideo ? 'mp4' : 'ogg';
+                    const fileName = `${msg.key.id}.${extension}`;
+                    fs.writeFileSync(path.join(mediaFolder, fileName), buffer);
+                    
+                    msgData.type = isImage ? 'image' : isVideo ? 'video' : 'audio';
+                    // Define a URL relativa para o frontend (Lovable) buscar
+                    msgData.mediaUrl = `/media/${fileName}`; 
+                    msgData.text = isImage?.caption || isVideo?.caption || '';
+                } catch (e) {
+                    console.log("Erro ao baixar mídia:", e.message);
+                }
+            }
+            messageStore.push(msgData);
+        }
+    });
 }
 
-// --- ENDPOINTS PARA O LOVABLE ---
-app.get('/status', (req, res) => res.json({ status: connectionStatus, qr: qrCodeBase64 }));
-app.get('/messages', (req, res) => res.json(messagesHistory));
-
+// ENDPOINTS DA API
+app.get('/status', (req, res) => res.json({ status: connectionStatus, qr: qrCode }));
+app.get('/messages', (req, res) => res.json(messageStore));
 app.post('/send', async (req, res) => {
-    let { number, message } = req.body;
-    if (connectionStatus !== "Conectado") return res.status(503).json({ error: "Offline" });
-    
+    const { number, message } = req.body;
     try {
-        let cleanNumber = String(number).replace(/\D/g, '');
-        if (!cleanNumber.startsWith('55')) cleanNumber = '55' + cleanNumber;
-        let jid = cleanNumber + '@s.whatsapp.net';
-        
+        const jid = formatBRNumber(number);
         await sock.sendMessage(jid, { text: message });
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        res.status(200).json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.listen(process.env.PORT || 3000, () => connectToWA());
+connectToWhatsApp();
+app.listen(process.env.PORT || 3000);
