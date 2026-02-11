@@ -108,3 +108,43 @@ app.post('/send', async (req, res) => {
 
 connectToWhatsApp();
 app.listen(process.env.PORT || 3000);
+// ===== Endpoint GET /history =====
+// Retorna TODAS as mensagens armazenadas (inclusive histórico antigo)
+
+app.get('/history', (req, res) => {
+  try {
+    // Parâmetros opcionais de paginação
+    const limit = parseInt(req.query.limit) || 0; // 0 = sem limite
+    const offset = parseInt(req.query.offset) || 0;
+
+    // messageStore é o array onde você guarda as mensagens no messages.upsert
+    let messages = [...messageStore];
+
+    // Ordenar por timestamp (mais antigas primeiro)
+    messages.sort((a, b) => {
+      const tsA = typeof a.timestamp === 'number' ? a.timestamp : 0;
+      const tsB = typeof b.timestamp === 'number' ? b.timestamp : 0;
+      return tsA - tsB;
+    });
+
+    // Aplicar paginação se solicitada
+    if (offset > 0) {
+      messages = messages.slice(offset);
+    }
+    if (limit > 0) {
+      messages = messages.slice(0, limit);
+    }
+
+    // Retornar com metadados
+    res.json({
+      total: messageStore.length,
+      returned: messages.length,
+      offset,
+      limit,
+      messages,
+    });
+  } catch (err) {
+    console.error('Erro no /history:', err.message);
+    res.status(500).json({ error: 'Falha ao buscar histórico' });
+  }
+});
