@@ -1,123 +1,12 @@
-const { default: makeWASocket, useMultiFileAuthState, disconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
-
-const app = express();
-app.use(express.json());
-app.use(cors());
-
-// 1. CONFIGURAÇÃO DE MÍDIA: Cria e serve a pasta para o Lovable acessar fotos/áudios
-const mediaFolder = path.join(__dirname, 'media');
-if (!fs.existsSync(mediaFolder)) fs.mkdirSync(mediaFolder, { recursive: true });
-app.use('/media', express.static(mediaFolder));
-
-let sock;
-let connectionStatus = "Desconectado";
-let qrCode = null;
-let messageStore = [];
-
-// 2. REGRA DO 9: Função para garantir que o número seja enviado sem o dígito 9 extra
-function formatBRNumber(number) {
-    let clean = String(number).replace(/\D/g, '');
-    if (clean.length === 13 && clean.startsWith('55')) {
-        clean = clean.slice(0, 4) + clean.slice(5);
-    }
-    if (!clean.startsWith('55')) clean = '55' + clean;
-    return clean + '@s.whatsapp.net';
-}
-
-async function connectToWhatsApp() {
-    // 3. FIXAÇÃO DE SESSÃO: Usa a pasta fixa para retomar a conexão sem novo QR Code
-    const { state, saveCreds } = await useMultiFileAuthState('sessao_definitiva');
-    
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true,
-        defaultQueryTimeoutMs: undefined
-    });
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) qrCode = qr;
-
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== disconnectReason.loggedOut;
-            if (shouldReconnect) connectToWhatsApp(); // Reconecta automaticamente
-        } else if (connection === 'open') {
-            connectionStatus = "Conectado";
-            qrCode = null;
-        }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        for (const msg of messages) {
-            if (!msg.message || msg.key.remoteJid === 'status@broadcast') continue;
-
-            let msgData = {
-                id: msg.key.id,
-                from: msg.key.remoteJid,
-                fromMe: msg.key.fromMe || false,
-                name: msg.pushName || 'Contato',
-                timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
-                type: 'text',
-                text: msg.message.conversation || msg.message.extendedTextMessage?.text || '',
-                mediaUrl: null
-            };
-
-            // 4. PROCESSAMENTO DE MÍDIA: Baixa fotos, vídeos e áudios
-            const isImage = msg.message.imageMessage;
-            const isVideo = msg.message.videoMessage;
-            const isAudio = msg.message.audioMessage;
-
-            if (isImage || isVideo || isAudio) {
-                try {
-                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                    const extension = isImage ? 'jpg' : isVideo ? 'mp4' : 'ogg';
-                    const fileName = `${msg.key.id}.${extension}`;
-                    fs.writeFileSync(path.join(mediaFolder, fileName), buffer);
-                    
-                    msgData.type = isImage ? 'image' : isVideo ? 'video' : 'audio';
-                    // Define a URL relativa para o frontend (Lovable) buscar
-                    msgData.mediaUrl = `/media/${fileName}`; 
-                    msgData.text = isImage?.caption || isVideo?.caption || '';
-                } catch (e) {
-                    console.log("Erro ao baixar mídia:", e.message);
-                }
-            }
-            messageStore.push(msgData);
-        }
-    });
-}
-
-// ENDPOINTS DA API
-app.get('/status', (req, res) => res.json({ status: connectionStatus, qr: qrCode }));
-app.get('/messages', (req, res) => res.json(messageStore));
-app.post('/send', async (req, res) => {
-    const { number, message } = req.body;
-    try {
-        const jid = formatBRNumber(number);
-        await sock.sendMessage(jid, { text: message });
-        res.status(200).json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-connectToWhatsApp();
-app.listen(process.env.PORT || 3000);
-// ===== Endpoint GET /history =====
-// Retorna TODAS as mensagens armazenadas (inclusive histórico antigo)
-
+// ========================================
+// ENDPOINT: GET /history
+// Retorna todas as mensagens armazenadas
+// ========================================
 app.get('/history', (req, res) => {
   try {
-    // Parâmetros opcionais de paginação
-    const limit = parseInt(req.query.limit) || 0; // 0 = sem limite
+    const limit = parseInt(req.query.limit) || 0;
     const offset = parseInt(req.query.offset) || 0;
 
-    // messageStore é o array onde você guarda as mensagens no messages.upsert
     let messages = [...messageStore];
 
     // Ordenar por timestamp (mais antigas primeiro)
@@ -127,7 +16,7 @@ app.get('/history', (req, res) => {
       return tsA - tsB;
     });
 
-    // Aplicar paginação se solicitada
+    // Paginação
     if (offset > 0) {
       messages = messages.slice(offset);
     }
@@ -135,7 +24,6 @@ app.get('/history', (req, res) => {
       messages = messages.slice(0, limit);
     }
 
-    // Retornar com metadados
     res.json({
       total: messageStore.length,
       returned: messages.length,
@@ -147,4 +35,153 @@ app.get('/history', (req, res) => {
     console.error('Erro no /history:', err.message);
     res.status(500).json({ error: 'Falha ao buscar histórico' });
   }
+});
+
+// ========================================
+// ENDPOINT: GET /chats
+// Retorna lista de contatos/conversas únicas
+// ========================================
+app.get('/chats', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+
+    // Agrupar mensagens por contato
+    const chatMap = {};
+
+    for (const msg of messageStore) {
+      const chatId = msg.from || msg.chatId || 'unknown';
+      if (chatId.includes('status@broadcast')) continue;
+
+      if (!chatMap[chatId]) {
+        chatMap[chatId] = {
+          id: chatId,
+          name: msg.name || msg.pushName || chatId,
+          lastMessage: '',
+          lastTimestamp: 0,
+          messageCount: 0,
+          unreadCount: 0,
+        };
+      }
+
+      const chat = chatMap[chatId];
+      chat.messageCount++;
+
+      const ts = msg.timestamp || 0;
+      if (ts > chat.lastTimestamp) {
+        chat.lastTimestamp = ts;
+        chat.lastMessage = msg.text || msg.body || msg.message || '';
+        if (msg.name || msg.pushName) {
+          chat.name = msg.name || msg.pushName;
+        }
+      }
+
+      if (!msg.fromMe) {
+        chat.unreadCount++;
+      }
+    }
+
+    // Converter para array e ordenar por mais recente
+    let chats = Object.values(chatMap);
+    chats.sort((a, b) => b.lastTimestamp - a.lastTimestamp);
+
+    const total = chats.length;
+
+    // Paginação
+    chats = chats.slice(offset, offset + limit);
+
+    res.json({
+      total,
+      returned: chats.length,
+      offset,
+      limit,
+      chats,
+    });
+  } catch (err) {
+    console.error('Erro no /chats:', err.message);
+    res.status(500).json({ error: 'Falha ao buscar conversas' });
+  }
+});
+
+// ========================================
+// ENDPOINT: GET /chat/:chatId
+// Retorna mensagens de uma conversa específica
+// ========================================
+app.get('/chat/:chatId', (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+
+    // Filtrar mensagens desse contato
+    let messages = messageStore.filter((msg) => {
+      const msgChatId = msg.from || msg.chatId || '';
+      // Comparar sem @s.whatsapp.net e sem caracteres especiais
+      const clean = msgChatId.replace(/@s\.whatsapp\.net$/, '').replace(/\D/g, '');
+      const cleanParam = chatId.replace(/\D/g, '');
+      return clean === cleanParam || clean.endsWith(cleanParam) || cleanParam.endsWith(clean);
+    });
+
+    // Ordenar por timestamp
+    messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+    const total = messages.length;
+
+    // Paginação
+    messages = messages.slice(offset, offset + limit);
+
+    res.json({
+      chatId,
+      total,
+      returned: messages.length,
+      offset,
+      limit,
+      messages,
+    });
+  } catch (err) {
+    console.error('Erro no /chat/:chatId:', err.message);
+    res.status(500).json({ error: 'Falha ao buscar mensagens do contato' });
+  }
+});
+
+// ========================================
+// ENDPOINT: GET /search
+// Busca mensagens por texto ou número
+// ========================================
+app.get('/search', (req, res) => {
+  try {
+    const query = (req.query.q || '').toLowerCase().trim();
+    const limit = parseInt(req.query.limit) || 20;
+
+    if (!query) {
+      return res.json({ results: [], total: 0 });
+    }
+
+    const results = messageStore.filter((msg) => {
+      const text = (msg.text || msg.body || msg.message || '').toLowerCase();
+      const from = (msg.from || msg.chatId || '').toLowerCase();
+      const name = (msg.name || msg.pushName || '').toLowerCase();
+      return text.includes(query) || from.includes(query) || name.includes(query);
+    });
+
+    // Mais recentes primeiro
+    results.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    res.json({
+      query,
+      total: results.length,
+      returned: Math.min(results.length, limit),
+      results: results.slice(0, limit),
+    });
+  } catch (err) {
+    console.error('Erro no /search:', err.message);
+    res.status(500).json({ error: 'Falha na busca' });
+  }
+});
+
+// ========================================
+// SERVIDOR - DEVE SER A ÚLTIMA LINHA
+// ========================================
+app.listen(port, () => {
+  console.log(`Servidor rodando na porta ${port}`);
 });
